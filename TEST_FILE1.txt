@@ -1,0 +1,127 @@
+4.4.2  Generate a self-signed cert (run on BOTH backend VMs) 
+
+For the lab, a self-signed cert per backend is sufficient. For production you would use certs from your private CA. 
+
+sudo mkdir -p /etc/ssl/lab 
+
+HOSTNAME=$(hostname) 
+
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \ 
+
+  -keyout /etc/ssl/lab/${HOSTNAME}.key \ 
+
+  -out /etc/ssl/lab/${HOSTNAME}.crt \ 
+
+  -subj "/CN=${HOSTNAME}.lab.internal" \ 
+
+  -addext "subjectAltName=DNS:${HOSTNAME}.lab.internal" 
+
+sudo chmod 600 /etc/ssl/lab/${HOSTNAME}.key 
+
+4.4.3  Configure nginx on 443 and 8490 
+
+sudo tee /etc/nginx/sites-available/lab > /dev/null <<EOF 
+
+server { 
+
+  listen 443 ssl; 
+
+  ssl_certificate     /etc/ssl/lab/$(hostname).crt; 
+
+  ssl_certificate_key /etc/ssl/lab/$(hostname).key; 
+
+  ssl_protocols TLSv1.2 TLSv1.3; 
+
+  location / { return 200 "backend=$(hostname) port=443\n"; } 
+
+} 
+
+server { 
+
+  listen 8490 ssl; 
+
+  ssl_certificate     /etc/ssl/lab/$(hostname).crt; 
+
+  ssl_certificate_key /etc/ssl/lab/$(hostname).key; 
+
+  ssl_protocols TLSv1.2 TLSv1.3; 
+
+  location / { return 200 "backend=$(hostname) port=8490\n"; } 
+
+} 
+
+EOF 
+
+sudo ln -sf /etc/nginx/sites-available/lab /etc/nginx/sites-enabled/lab 
+
+sudo rm -f /etc/nginx/sites-enabled/default 
+
+sudo nginx -t && sudo systemctl restart nginx 
+
+4.4.4  Configure Postfix on 25 with STARTTLS 
+
+sudo postconf -e "smtpd_tls_security_level=may" 
+
+sudo postconf -e "smtpd_tls_cert_file=/etc/ssl/lab/$(hostname).crt" 
+
+sudo postconf -e "smtpd_tls_key_file=/etc/ssl/lab/$(hostname).key" 
+
+sudo postconf -e "inet_interfaces=all" 
+
+sudo systemctl restart postfix 
+
+4.4.5  Configure a TLS listener on 8495 using socat 
+
+sudo tee /etc/systemd/system/lab-8495.service > /dev/null <<EOF 
+
+[Unit] 
+
+Description=Lab TLS echo service on 8495 
+
+After=network.target 
+
+ 
+
+[Service] 
+
+ExecStart=/usr/bin/socat openssl-listen:8495,reuseaddr,fork,\ 
+
+  cert=/etc/ssl/lab/$(hostname).crt,\ 
+
+  key=/etc/ssl/lab/$(hostname).key,\ 
+
+  verify=0 \ 
+
+  system:'echo backend=$(hostname) port=8495' 
+
+Restart=always 
+
+ 
+
+[Install] 
+
+WantedBy=multi-user.target 
+
+EOF 
+
+sudo systemctl daemon-reload 
+
+sudo systemctl enable --now lab-8495.service 
+
+4.4.6  Open host firewall (ufw) if enabled 
+
+sudo ufw status   # if 'inactive' skip the next lines 
+
+sudo ufw allow 25/tcp 
+
+sudo ufw allow 443/tcp 
+
+sudo ufw allow 8490/tcp 
+
+sudo ufw allow 8495/tcp 
+
+4.4.7  Verify locally on each backend 
+
+sudo ss -tlnp | grep -E ':(25|443|8490|8495) ' 
+
+# Should show 4 listeners 
