@@ -1,0 +1,228 @@
+## Lab architecture
+
+```
+Ubuntu Client (Azure)  ──TCP/443──►  App Gateway (L4, TCP listener :443)  ──TCP/443──►  Ubuntu Backend (on-prem)
+   10.x.x.x                              FrontIP: 20.x.x.x                                     192.168.x.x
+```
+
+A long-running TCP connection means: one TCP session that stays open for minutes/hours, exchanges data periodically, and survives idle gaps. We'll use a TLS-wrapped persistent socket and validate the three claims under load and over time.
+
+## Part 1 — Configuration
+
+### App Gateway
+
+| Setting | Value |
+|---|---|
+| Tier | Standard_v2 |
+| Listener `lsn-443` | Protocol **TCP**, Port **443**, Frontend IP = Public or Private |
+| Backend pool `bp-onprem` | Backend Ubuntu IP/FQDN (reachable via VPN/ExpressRoute or public IP) |
+| Backend setting `bs-tcp-443` | Protocol **TCP**, Port **443**, Timeout **86400** sec (24h — critical for long-running) |
+| Routing rule | `lsn-443` → `bp-onprem` + `bs-tcp-443` |
+| Health probe | Custom TCP probe on 443, interval 30s |
+
+The default TCP idle timeout on App Gateway is 4 minutes; raise the **backend setting timeout** to keep long-lived sessions alive. (The frontend idle timeout is also configurable per listener — set it to match.)
+
+**Do not upload any TLS certificate to App Gateway.** That's the whole point.
+
+### Backend Ubuntu VM (on-prem)
+
+Generate a self-signed cert with a recognizable CN — this is your forensic fingerprint:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout /etc/ssl/backend.key -out /etc/ssl/backend.crt \
+  -subj "/CN=backend-e2e-tls-proof-2026"
+chmod 600 /etc/ssl/backend.key
+```
+
+Run a long-lived TLS echo server on 443. Use Python so you can see exactly what's happening:
+
+```python
+# /opt/tls_echo.py
+import socket, ssl, threading, time, datetime
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain('/etc/ssl/backend.crt', '/etc/ssl/backend.key')
+
+def handle(conn, addr):
+    print(f"[{datetime.datetime.now()}] OPEN  from {addr}")
+    try:
+        while True:
+            data = conn.recv(4096)
+            if not data: break
+            conn.sendall(b"ECHO " + data)
+    except Exception as e:
+        print(f"  err: {e}")
+    finally:
+        print(f"[{datetime.datetime.now()}] CLOSE from {addr}")
+        conn.close()
+
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', 443))
+s.listen(50)
+ss = ctx.wrap_socket(s, server_side=True)
+print("listening on :443")
+while True:
+    c, a = ss.accept()
+    threading.Thread(target=handle, args=(c, a), daemon=True).start()
+```
+
+```bash
+sudo python3 /opt/tls_echo.py
+```
+
+Open firewall: allow inbound TCP/443 from App Gateway's egress IPs.
+
+### Client Ubuntu VM (Azure)
+
+Install tools and write a long-running TLS client that sends a heartbeat every 10 seconds:
+
+```bash
+sudo apt-get install -y tcpdump tshark openssl python3
+```
+
+```python
+# ~/tls_longrun.py
+import socket, ssl, time, datetime, sys
+
+APPGW = sys.argv[1]   # AppGW frontend IP/FQDN
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE   # accept self-signed for the lab
+
+raw = socket.create_connection((APPGW, 443))
+tls = ctx.wrap_socket(raw, server_hostname=APPGW)
+
+print(f"local socket = {raw.getsockname()}  cipher = {tls.cipher()[0]}")
+cert = tls.getpeercert(binary_form=True)
+import hashlib
+print(f"server cert sha256 = {hashlib.sha256(cert).hexdigest()}")
+
+i = 0
+while True:
+    msg = f"hb-{i}-{datetime.datetime.now().isoformat()}\n".encode()
+    tls.sendall(msg)
+    reply = tls.recv(4096)
+    print(f"sent #{i}, reply={reply.strip().decode()}")
+    i += 1
+    time.sleep(10)
+```
+
+## Part 2 — Capture before you run the test
+
+**Backend** terminal A:
+```bash
+sudo tcpdump -i any -nn -s0 -w /tmp/backend.pcap 'tcp port 443'
+```
+
+**Client** terminal A:
+```bash
+sudo tcpdump -i any -nn -s0 -w /tmp/client.pcap 'tcp port 443'
+```
+
+**Client** terminal B — start the long-running connection:
+```bash
+python3 ~/tls_longrun.py <APPGW_FRONTEND_IP>
+```
+
+Let it run **at least 5 minutes** (30 heartbeats). This proves the connection is genuinely long-lived and that all heartbeats use the same TLS session.
+
+Stop tcpdump on both ends after you've collected enough.
+
+## Part 3 — Test cases
+
+### Test 1 — Two independent TCP handshakes
+
+```bash
+# On client
+tshark -r /tmp/client.pcap -Y 'tcp.flags.syn==1' \
+  -T fields -e frame.time_relative -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport -e tcp.seq_raw
+
+# On backend
+tshark -r /tmp/backend.pcap -Y 'tcp.flags.syn==1' \
+  -T fields -e frame.time_relative -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport -e tcp.seq_raw
+```
+
+**Pass criteria:**
+- Client pcap: SYN with `src=ClientVM_IP`, `dst=AppGW_FrontIP`, ISN = X.
+- Backend pcap: SYN with `src=AppGW_instance_IP` (from the AppGW subnet, **not** the client's IP), `dst=BackendVM_IP`, ISN = Y.
+- **X ≠ Y** and **src IPs differ** → two separate TCP state machines.
+
+### Test 2 — One TLS session, identical handshake bytes both legs
+
+```bash
+tshark -r /tmp/client.pcap  -Y 'tls.handshake.type==1' \
+  -T fields -e tls.handshake.random -e tls.handshake.session_id
+tshark -r /tmp/backend.pcap -Y 'tls.handshake.type==1' \
+  -T fields -e tls.handshake.random -e tls.handshake.session_id
+```
+
+**Pass criteria:** `client_random` and `session_id` are **byte-identical** on both pcaps. The client generated `client_random` exactly once; seeing it on the backend's wire proves App Gateway forwarded the original handshake — it did not negotiate its own.
+
+### Test 3 — Backend cert reaches client unmodified
+
+On the backend, get the cert fingerprint:
+```bash
+openssl x509 -in /etc/ssl/backend.crt -noout -fingerprint -sha256
+# e.g. SHA256 Fingerprint=AB:CD:EF:...
+```
+
+The client's Python output already printed `server cert sha256 = ...`. Convert and compare:
+```bash
+# Compare these two values
+echo "AB:CD:EF:..." | tr -d ':' | tr 'A-Z' 'a-z'   # backend's
+# vs the hash printed by the client script
+```
+
+**Pass criteria:** identical. The cert the client received is bit-for-bit the cert the backend serves. App Gateway did not re-sign, re-issue, or substitute anything.
+
+### Test 4 — Long-running connection stays on ONE backend TCP session
+
+```bash
+tshark -r /tmp/backend.pcap -Y 'tcp.flags.syn==1 and tcp.flags.ack==0' | wc -l
+```
+
+**Pass criteria:** Exactly **1** SYN over the entire 5-minute capture, despite 30+ heartbeats exchanged. The same backend TCP connection carried every heartbeat — proof of TCP-level pinning across the proxy.
+
+### Test 5 — Heartbeats encrypted across both legs
+
+```bash
+tshark -r /tmp/client.pcap  -Y 'tls.app_data' -T fields -e frame.len | wc -l
+tshark -r /tmp/backend.pcap -Y 'tls.app_data' -T fields -e frame.len | wc -l
+```
+
+**Pass criteria:** Both legs show ~30 `Application Data` records. Try to read the plaintext heartbeats:
+```bash
+tshark -r /tmp/backend.pcap -Y 'tls.app_data' -V | grep -c "hb-"
+# expected: 0
+```
+You will find zero matches. The string `hb-0-2026...` is in the plaintext on the client and on the backend, but on the wire (both legs) it is encrypted. App Gateway, sitting between, sees only ciphertext — and it does so without holding any key.
+
+### Test 6 — TCP re-handshake test (kill the connection, start a new one)
+
+Stop the client script, restart it. Look for SYNs again:
+```bash
+tshark -r /tmp/client.pcap -Y 'tcp.flags.syn==1 and tcp.flags.ack==0' | wc -l
+```
+
+**Pass criteria:** Each new client invocation produces a new SYN to App Gateway AND a new SYN from App Gateway to the backend. New TLS handshake, new `client_random`, possibly a different App Gateway instance IP if you have multiple instances. Confirms the per-connection load balancing decision is fresh each time.
+
+## Part 4 — Compile the evidence
+
+| Claim | Test | Expected result |
+|---|---|---|
+| TCP terminated twice | 1 | Two SYNs with different src IPs and different ISNs |
+| TCP genuinely two separate state machines | 4 | Single backend TCP carries all 30 heartbeats — independent of the client side |
+| TLS terminated once, end-to-end | 2 | Identical `client_random` on both legs |
+| App Gateway holds no key material | 3 | Backend cert SHA256 = cert SHA256 the client received |
+| App Gateway sees only ciphertext | 5 | Plaintext heartbeat strings absent from both pcaps; only `Application Data` records visible |
+| Per-connection LB decision | 6 | Fresh SYNs and fresh TLS handshake on each new client run |
+
+If all six pass, you have empirically confirmed the theory under realistic long-running conditions. Keep the pcaps — they're your proof artifacts.
+
+## Quick gotchas
+
+- If the client connection drops at exactly 4 minutes idle, you forgot to raise the App Gateway backend setting timeout.
+- If the backend never sees the SYN, the App Gateway egress IPs aren't allowed by your on-prem firewall (check the AppGW subnet range, not the frontend IP).
+- If `tshark` shows the TLS handshake as `Encrypted Handshake Message` and you can't see `client_random`, you're on TLS 1.3 with encrypted handshakes after `ServerHello` — `client_random` is still in the cleartext `ClientHello` on both legs, that's enough.
