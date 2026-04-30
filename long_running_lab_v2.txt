@@ -1,0 +1,278 @@
+## Lab plan
+
+You'll run **persistent TLS echo servers** on four ports on the on-prem Ubuntu VM (under `systemd` so they survive your SSH logout), front them with App Gateway L4 listeners, and from the Azure Ubuntu VM run **long-lived `openssl s_client` sessions** plus a scripted **data-transfer test**. Captures on both endpoints prove the two-TCP / one-TLS claim.
+
+---
+
+## Part A — Backend Ubuntu VM (on-prem)
+
+### A1. One self-signed cert with a recognizable CN
+
+```bash
+sudo mkdir -p /etc/lab-tls && cd /etc/lab-tls
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 90 \
+  -keyout backend.key -out backend.crt \
+  -subj "/CN=backend-proves-e2e-tls"
+sudo chmod 640 backend.key
+```
+
+The CN `backend-proves-e2e-tls` is your fingerprint — if the client sees this CN, the cert came from the backend, not from App Gateway.
+
+### A2. Persistent TLS echo servers — one systemd unit per port
+
+`openssl s_server` exits after each client disconnect, so wrap it in a restart loop. Create `/etc/systemd/system/tlsecho@.service`:
+
+```ini
+[Unit]
+Description=TLS echo on port %i
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/openssl s_server -accept %i -cert /etc/lab-tls/backend.crt -key /etc/lab-tls/backend.key -quiet -naccept -1
+Restart=always
+RestartSec=1
+User=nobody
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`%i` is the port template parameter. `-naccept -1` means accept unlimited connections; `Restart=always` covers the case of openssl exiting on any error. Enable all four ports:
+
+```bash
+sudo systemctl daemon-reload
+for p in 443 25 8490 8495; do
+  sudo systemctl enable --now tlsecho@${p}.service
+done
+sudo systemctl status 'tlsecho@*'
+```
+
+Confirm they're listening:
+```bash
+sudo ss -ltnp | grep -E ':(443|25|8490|8495)\b'
+```
+
+These survive logout because they're systemd services, not your shell's children.
+
+### A3. Firewall — allow App Gateway's egress
+
+```bash
+sudo ufw allow from <APPGW_BACKEND_SUBNET_CIDR> to any port 443,25,8490,8495 proto tcp
+sudo ufw status
+```
+
+### A4. Make the App Gateway health probe pass
+
+Default TCP probe just needs a TCP handshake to succeed — the openssl listener provides that. **No HTTP probe, no path, no host header.** In each Backend Setting on App Gateway, use a custom **TCP** probe (interval 30s, threshold 3, timeout 30s) on the matching port. As soon as `tlsecho@443` accepts a SYN, the probe goes healthy.
+
+Verify from inside Azure later:
+```bash
+nc -zv <BACKEND_IP> 443 25 8490 8495
+```
+
+---
+
+## Part B — App Gateway
+
+| Setting | Value |
+|---|---|
+| Tier | Standard_v2 |
+| Listeners | 4 × TCP listeners on **443, 25, 8490, 8495** |
+| Backend pool | Single pool, member = backend VM IP/FQDN |
+| Backend settings | 4 × **TCP** protocol, port matching the listener, timeout 60s, **EnableClientIpPreservation = false** for the cleanest first test |
+| Routing rules | listener:443→pool:443, listener:25→pool:25, listener:8490→pool:8490, listener:8495→pool:8495 |
+| Health probe | Custom **TCP** probe per backend setting, on the same port |
+
+After deploy, in the portal: **Monitoring → Backend health** must show all four entries **Healthy** before you continue. If any show Unhealthy, recheck the on-prem firewall and confirm `tlsecho@<port>` is `active (running)`.
+
+---
+
+## Part C — Source Ubuntu VM (Azure)
+
+```bash
+sudo apt-get install -y openssl tshark tmux
+```
+
+Allow non-root capture (optional, convenient):
+```bash
+sudo dpkg-reconfigure wireshark-common   # answer Yes
+sudo usermod -aG wireshark $USER
+```
+
+---
+
+## Part D — Test cases
+
+### D1. Capture in the background on both ends
+
+You can only SSH one VM at a time, so kick the captures off via `nohup` (or `tmux`) and reconnect later to collect.
+
+**Backend** (start, log out, come back):
+```bash
+nohup sudo tcpdump -i any -nn -s0 -w /tmp/backend.pcap \
+  'tcp port 443 or tcp port 25 or tcp port 8490 or tcp port 8495' \
+  >/tmp/tcpdump.log 2>&1 &
+disown
+```
+
+**Source VM** (same):
+```bash
+nohup sudo tcpdump -i any -nn -s0 -w /tmp/client.pcap \
+  'tcp port 443 or tcp port 25 or tcp port 8490 or tcp port 8495' \
+  >/tmp/tcpdump.log 2>&1 &
+disown
+```
+
+`disown` removes the job from the shell's table so it survives logout. You can confirm with `ps -ef | grep tcpdump` after re-SSHing.
+
+### D2. Long-running TLS connection per port (the headline test)
+
+From the source VM, open four persistent sessions in `tmux` so they all run in parallel and survive disconnect:
+
+```bash
+tmux new -d -s p443  "openssl s_client -connect <APPGW_FRONT_IP>:443  -keepalive -showcerts | tee /tmp/s_443.out"
+tmux new -d -s p25   "openssl s_client -connect <APPGW_FRONT_IP>:25   -keepalive -showcerts | tee /tmp/s_25.out"
+tmux new -d -s p8490 "openssl s_client -connect <APPGW_FRONT_IP>:8490 -keepalive -showcerts | tee /tmp/s_8490.out"
+tmux new -d -s p8495 "openssl s_client -connect <APPGW_FRONT_IP>:8495 -keepalive -showcerts | tee /tmp/s_8495.out"
+```
+
+`-keepalive` sets `SO_KEEPALIVE` on the client socket so the TCP doesn't go idle. Sessions stay open until you kill them.
+
+### D3. Data transfer in the mix
+
+`s_server -www` would close after sending, but `s_server` (no `-www`) is a **bidirectional echo** — anything you type comes back. Drive it with a script. Re-attach to one tmux:
+
+```bash
+tmux attach -t p8490
+```
+
+Type some lines, see them echoed, detach with `Ctrl-b d`. Or automate it — run from the source VM:
+
+```bash
+for port in 443 25 8490 8495; do
+  ( for i in $(seq 1 50); do
+      echo "PORT-$port MSG-$i $(date +%H:%M:%S.%N)"
+      sleep 2
+    done ) | openssl s_client -connect <APPGW_FRONT_IP>:$port -ign_eof \
+              > /tmp/echo_$port.out 2>&1 &
+done
+wait
+```
+
+After this completes, `grep "PORT-443 MSG-50" /tmp/echo_443.out` should show the line returned by the backend echo — proof that bidirectional encrypted data crossed end-to-end.
+
+For a **bigger** transfer (say 10 MB) on one port:
+```bash
+head -c 10485760 /dev/urandom | base64 \
+  | openssl s_client -connect <APPGW_FRONT_IP>:8495 -ign_eof -quiet \
+  > /tmp/echo_8495_bulk.out
+wc -c /tmp/echo_8495_bulk.out   # should be ~ what you sent
+sha256sum /tmp/echo_8495_bulk.out
+```
+Run the same `sha256sum` on what was actually sent (`tee` the input first). Matching hashes confirm no corruption across the proxy.
+
+### D4. Stop captures and analyze
+
+```bash
+sudo pkill tcpdump
+```
+
+Pull both pcaps to one workstation and run these checks **per port**.
+
+---
+
+## Part E — What the captures must show
+
+### E1. Two independent TCP handshakes per session
+
+```bash
+# On client.pcap: one SYN per port, src = client VM IP
+tshark -r client.pcap -Y 'tcp.flags.syn==1 and tcp.flags.ack==0' \
+  -T fields -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport -e tcp.seq_raw
+
+# On backend.pcap: one SYN per port, src = APPGW INSTANCE IP (from AppGW subnet)
+tshark -r backend.pcap -Y 'tcp.flags.syn==1 and tcp.flags.ack==0' \
+  -T fields -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport -e tcp.seq_raw
+```
+
+You should observe, per port:
+
+| Leg | src IP | dst IP | Initial seq |
+|---|---|---|---|
+| Frontend | **client VM IP** | AppGW front IP | e.g. `2_847_193_004` |
+| Backend | **AppGW subnet IP** ≠ client | backend IP | e.g. `1_392_004_771` |
+
+Different src IPs and **different initial sequence numbers** = two TCP state machines = TCP terminated twice.
+
+### E2. One TLS handshake, identical bytes on both legs
+
+```bash
+# Compare ClientHello.random — generated once by the client
+tshark -r client.pcap  -Y 'tls.handshake.type==1' \
+  -T fields -e tcp.dstport -e tls.handshake.random | sort > /tmp/c_random.txt
+tshark -r backend.pcap -Y 'tls.handshake.type==1' \
+  -T fields -e tcp.dstport -e tls.handshake.random | sort > /tmp/b_random.txt
+
+diff /tmp/c_random.txt /tmp/b_random.txt && echo "IDENTICAL — same TLS handshake on both legs"
+```
+
+Same 32-byte `client_random` on both pcaps for all four ports = App Gateway forwarded the handshake byte-for-byte; it did not originate one.
+
+### E3. The certificate proves origin
+
+```bash
+for p in 443 25 8490 8495; do
+  echo "=== port $p ==="
+  grep -A1 "subject=" /tmp/s_${p}.out | head -2
+  grep "Verify return code" /tmp/s_${p}.out
+done
+```
+
+Expected for every port:
+```
+subject=CN=backend-proves-e2e-tls
+Verify return code: 18 (self signed certificate)
+```
+
+App Gateway has no cert configured. The only entity that could have produced this CN is your backend VM. The cert reached the client unmodified → TLS terminated **at the backend, not at App Gateway**.
+
+### E4. Connection is genuinely long-lived
+
+While captures are still running, on the source VM:
+```bash
+ss -tnp | grep -E ':(443|25|8490|8495)'
+```
+ESTABLISHED state with growing duration. On the backend VM (after re-SSH):
+```bash
+sudo ss -tnp | grep -E ':(443|25|8490|8495)' | grep ESTAB
+```
+You'll see ESTABLISHED connections whose remote address is the **App Gateway instance IP**, not your client. Same TCP, two different remote peers.
+
+### E5. App Gateway health stays healthy throughout
+
+In the portal: **Backend health** screen — refresh during the test. All four entries remain Healthy because the TCP probe keeps succeeding against the always-on `tlsecho@*` services.
+
+---
+
+## Part F — Result matrix you'll fill in
+
+| Port | 2 distinct SYNs (different src IP)? | `client_random` matches across pcaps? | Cert CN at client = `backend-proves-e2e-tls`? | Echo data round-trips? | AppGW backend health |
+|---|---|---|---|---|---|
+| 443 | | | | | |
+| 25 | | | | | |
+| 8490 | | | | | |
+| 8495 | | | | | |
+
+All five columns "yes" on all four rows = the claim is empirically validated for your environment.
+
+## Cleanup
+
+```bash
+# backend
+for p in 443 25 8490 8495; do sudo systemctl disable --now tlsecho@${p}; done
+sudo rm /etc/systemd/system/tlsecho@.service /etc/lab-tls -rf
+
+# source
+tmux kill-server
+sudo pkill tcpdump
+```
