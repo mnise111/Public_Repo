@@ -1,79 +1,70 @@
-## What the doc actually says
+## What the docs actually say
 
-A configuration update (PUT) on Application Gateway ends the active connections after the default draining timeout period. Default draining = 30 seconds, and at present, a user-defined draining value is not supported.
+A configuration update (PUT) on Application Gateway ends the active connections after the default draining timeout period. The default draining timeout is 30 seconds, and a user-defined draining value is not supported.
 
-## Theoretical behaviour
+## Theoretical interruption per config change
 
-| Event | Effect on existing TCP connection |
+With 8 instances, App Gateway updates them in batches (rolling). For a long-running TLS-over-TCP connection pinned to one instance:
+
+| Event on your instance | Expected impact on your connection |
 |---|---|
-| Any config PUT (rule, listener, backend, cert, tag…) | Existing connections drained, then **forcibly closed at ~30s** |
-| New connections during/after PUT | Accepted normally on the new config |
-| Autoscale add/remove instance | Same draining behaviour on the affected instance |
-| Azure platform maintenance | Same draining behaviour |
+| Instance not in the current batch | 0 ms — connection unaffected |
+| Instance in the batch being updated | Connection enters draining; **closed at ~30s** if still open |
+| Reconnect after drop | New TCP + TLS handshake against a healthy instance, typically **<1s** |
 
-So your long-running TLS-over-TCP session **will be cut** every time someone touches the App Gateway. You cannot prevent it. You can only **detect it and reconnect fast**.
+So per config change, **either no interruption at all, or one ~30s drain followed by a ~1s reconnect** — depending on which of the 8 instances your flow happens to be pinned to.
 
-## What you have to do in your app
+## Minimal lab — one client, one server, one timeline
 
-Reconnect logic. Three rules:
+Use your existing port 8490 setup. You only need to add a "heartbeat with timestamp" so you can see the exact second the connection drops and the exact second the reconnect succeeds.
 
-1. Treat connection drop as normal, not as an error.
-2. Reconnect immediately — App Gateway accepts new connections during draining.
-3. Resume from the last acknowledged byte/message (your app must track this; TCP can't).
+### Backend (already running from previous lab)
 
-## Lab — measure the interruption
+`ncat --ssl ... -lk -p 8490 -c cat` — nothing to change.
 
-Reuse port 8490 from your existing lab. One change on App Gateway, one log on the client.
-
-### Source VM — run this loop
+### Source VM — one line that logs every event with a timestamp
 
 ```bash
-while true; do
-  date -u +%FT%T.%3NZ
-  sleep 0.2
-done | openssl s_client -connect $APPGW:8490 -quiet 2>/dev/null \
-     | ts '%FT%H:%M:%.S' > drain.log &
+while true; do echo "$(date -u +%FT%T.%3NZ) RECONNECT"; (while true; do date -u +%FT%T.%3NZ; sleep 1; done) | openssl s_client -connect $APPGW:8490 -quiet 2>/dev/null; done | tee -a heartbeat.log
 ```
 
-This sends 5 timestamps/sec into the TLS tunnel. Echo comes back, `ts` stamps the receive time. Any gap in the log = the interruption.
-
-(Install once: `sudo apt install -y moreutils` for `ts`.)
-
-### Trigger a config change on App Gateway
-
-In the Azure portal, edit any harmless field (e.g. add a tag, change autoscale max from 10 to 11) and click **Save**. Note the wall-clock time.
-
-### Reconnect when it drops
-
-The `openssl s_client` will exit when App Gateway closes the socket. Wrap the whole pipeline in a retry loop so you measure end-to-end recovery:
+What this does: opens a TLS connection through App Gateway, sends one timestamp per second, echoes received timestamps to `heartbeat.log`, and **the moment the connection drops**, the inner loop exits and the outer `while` immediately reconnects, logging `RECONNECT` with a timestamp. Run inside `tmux` so you can leave it:
 
 ```bash
-while true; do
-  while true; do date -u +%FT%T.%3NZ; sleep 0.2; done \
-    | openssl s_client -connect $APPGW:8490 -quiet 2>/dev/null
-  echo "RECONNECT $(date -u +%FT%T.%3NZ)"
-done | ts '%FT%H:%M:%.S' > drain.log
+tmux new -d -s hb 'while true; do echo "$(date -u +%FT%T.%3NZ) RECONNECT"; (while true; do date -u +%FT%T.%3NZ; sleep 1; done) | openssl s_client -connect $APPGW:8490 -quiet 2>/dev/null; done | tee -a heartbeat.log'
 ```
+
+### Trigger a config change
+
+In the Azure portal, do something harmless that forces a PUT — easiest is **add a tag** to the App Gateway resource and Save, or change min instance count by 1 and revert. Note the wall-clock time you click Save.
 
 ### Read the result
 
 ```bash
-grep RECONNECT drain.log
-# look at the gap between the last successful echo and the next one
-awk '{print $1}' drain.log | uniq -c | sort -k1 -n | tail
+grep -B1 RECONNECT heartbeat.log | tail -20
 ```
 
-You will see:
-- Activity continues for **~30 seconds after the PUT** (draining window).
-- A gap of **typically 1–5 seconds** while the TCP socket is torn down and a new one is established through App Gateway.
-- Activity resumes on a fresh TCP + fresh TLS handshake.
+You'll see a pattern like:
+```
+2026-05-01T10:14:32.104Z      <- last timestamp echoed before drop
+2026-05-01T10:15:02.881Z RECONNECT   <- reconnect succeeded
+```
 
-## What this tells you to design for
+The gap between those two timestamps **is your interruption duration** for this connection on this config change.
 
-| Number you measured | What to do with it |
-|---|---|
-| Drain window (~30s after PUT) | Don't panic on first sign of slowness — connection is still alive |
-| Reconnect gap (~seconds) | Set application-level reconnect retry to start immediately, back off only after 3+ failures |
-| Total disruption per change (~30s + reconnect) | Schedule App Gateway changes in a maintenance window if your protocol can't tolerate it |
+## What to expect across multiple changes
 
-If your application-layer protocol cannot resume cleanly (e.g. mid-transaction database writes, half-uploaded files), you need **idempotent operations** or a **message-level ack/replay layer** above TCP. App Gateway gives you no other lever — the 30-second drain is fixed and not configurable.
+Run 5–10 config changes (with a few minutes between each) and tabulate the gaps:
+
+| Change # | Gap (s) | Interpretation |
+|---|---|---|
+| 1 | ~0 | your instance wasn't in the batch |
+| 2 | ~31 | your instance was in the batch — drained at 30s + ~1s reconnect |
+| 3 | ~0 | not in batch |
+| ... | | |
+
+With 8 instances, statistically your single connection lands in the affected batch on a fraction of changes (depends on Azure's batch size — typically 1–2 instances at a time). Most changes are invisible to you; the ones that hit your instance show ~30s.
+
+## Bottom line for your design
+
+Worst-case per config change for any one long-running flow: **≈30 seconds**, deterministic, then auto-recovers. To make the application resilient, the client must **reconnect on TCP close** — exactly what the one-liner above does. If your real client doesn't auto-reconnect, that's the gap to close in the application, not in App Gateway.
