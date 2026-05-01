@@ -1,0 +1,79 @@
+## What the doc actually says
+
+A configuration update (PUT) on Application Gateway ends the active connections after the default draining timeout period. Default draining = 30 seconds, and at present, a user-defined draining value is not supported.
+
+## Theoretical behaviour
+
+| Event | Effect on existing TCP connection |
+|---|---|
+| Any config PUT (rule, listener, backend, cert, tag…) | Existing connections drained, then **forcibly closed at ~30s** |
+| New connections during/after PUT | Accepted normally on the new config |
+| Autoscale add/remove instance | Same draining behaviour on the affected instance |
+| Azure platform maintenance | Same draining behaviour |
+
+So your long-running TLS-over-TCP session **will be cut** every time someone touches the App Gateway. You cannot prevent it. You can only **detect it and reconnect fast**.
+
+## What you have to do in your app
+
+Reconnect logic. Three rules:
+
+1. Treat connection drop as normal, not as an error.
+2. Reconnect immediately — App Gateway accepts new connections during draining.
+3. Resume from the last acknowledged byte/message (your app must track this; TCP can't).
+
+## Lab — measure the interruption
+
+Reuse port 8490 from your existing lab. One change on App Gateway, one log on the client.
+
+### Source VM — run this loop
+
+```bash
+while true; do
+  date -u +%FT%T.%3NZ
+  sleep 0.2
+done | openssl s_client -connect $APPGW:8490 -quiet 2>/dev/null \
+     | ts '%FT%H:%M:%.S' > drain.log &
+```
+
+This sends 5 timestamps/sec into the TLS tunnel. Echo comes back, `ts` stamps the receive time. Any gap in the log = the interruption.
+
+(Install once: `sudo apt install -y moreutils` for `ts`.)
+
+### Trigger a config change on App Gateway
+
+In the Azure portal, edit any harmless field (e.g. add a tag, change autoscale max from 10 to 11) and click **Save**. Note the wall-clock time.
+
+### Reconnect when it drops
+
+The `openssl s_client` will exit when App Gateway closes the socket. Wrap the whole pipeline in a retry loop so you measure end-to-end recovery:
+
+```bash
+while true; do
+  while true; do date -u +%FT%T.%3NZ; sleep 0.2; done \
+    | openssl s_client -connect $APPGW:8490 -quiet 2>/dev/null
+  echo "RECONNECT $(date -u +%FT%T.%3NZ)"
+done | ts '%FT%H:%M:%.S' > drain.log
+```
+
+### Read the result
+
+```bash
+grep RECONNECT drain.log
+# look at the gap between the last successful echo and the next one
+awk '{print $1}' drain.log | uniq -c | sort -k1 -n | tail
+```
+
+You will see:
+- Activity continues for **~30 seconds after the PUT** (draining window).
+- A gap of **typically 1–5 seconds** while the TCP socket is torn down and a new one is established through App Gateway.
+- Activity resumes on a fresh TCP + fresh TLS handshake.
+
+## What this tells you to design for
+
+| Number you measured | What to do with it |
+|---|---|
+| Drain window (~30s after PUT) | Don't panic on first sign of slowness — connection is still alive |
+| Reconnect gap (~seconds) | Set application-level reconnect retry to start immediately, back off only after 3+ failures |
+| Total disruption per change (~30s + reconnect) | Schedule App Gateway changes in a maintenance window if your protocol can't tolerate it |
+
+If your application-layer protocol cannot resume cleanly (e.g. mid-transaction database writes, half-uploaded files), you need **idempotent operations** or a **message-level ack/replay layer** above TCP. App Gateway gives you no other lever — the 30-second drain is fixed and not configurable.
