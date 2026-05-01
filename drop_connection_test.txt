@@ -1,70 +1,89 @@
-## What the docs actually say
+## Theoretical behaviour
 
-A configuration update (PUT) on Application Gateway ends the active connections after the default draining timeout period. The default draining timeout is 30 seconds, and a user-defined draining value is not supported.
+From the docs: The default draining timeout value for backend servers is 30 seconds. At present, a user-defined draining value is not supported. And: A configuration update (PUT) on Application Gateway ends the active connections after the default draining timeout period.
 
-## Theoretical interruption per config change
+So per config change: **up to 30 seconds** of in-flight connections being drained, then forcibly closed. Existing connections on instances *not* being recycled may survive; connections on recycled instances are killed. With 8 instances and a rolling update, you should expect **a portion** of long-lived TCP connections to drop per change, with each affected client reconnecting within ~30s of the drain.
 
-With 8 instances, App Gateway updates them in batches (rolling). For a long-running TLS-over-TCP connection pinned to one instance:
+## What you'll measure
 
-| Event on your instance | Expected impact on your connection |
+Time between **last byte received** on the old connection and **first byte received** on the new connection. That's your real interruption.
+
+## Lab setup
+
+### Backend (one tmux pane is enough — reuse port 8490 from your existing lab)
+
+```bash
+tmux new -d -s recon ; tmux send-keys -t recon "while true; do date -u +%FT%T.%3NZ; sleep 0.1; done | sudo ncat --ssl --ssl-cert ~/lab/backend.crt --ssl-key ~/lab/backend.key -lk -p 8490" C-m
+```
+
+This streams a UTC timestamp every 100ms to whoever connects. One line ≈ 100ms granularity for measuring gaps.
+
+### Source VM (Azure Ubuntu) — single resilient client
+
+Open 8 parallel long-lived clients so you can see how many of the 8 AppGW instances are affected:
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do tmux new -d -s c$i "while true; do echo \"--- RECONNECT $(date -u +%FT%T.%3NZ) ---\"; ncat --ssl $APPGW 8490 < /dev/null; sleep 0.05; done | tee ~/lab/c$i.log" ; done
+```
+
+Each session loops: connect, drain whatever the server sends until the socket closes, log a `--- RECONNECT <timestamp> ---` marker, reconnect. Logs land in `~/lab/c1.log` … `c8.log`.
+
+Let them run for ~60s to confirm baseline (no reconnect markers should appear).
+
+## Trigger a config change
+
+Pick a no-op-ish change that still issues a PUT. From Azure Cloud Shell or `az` CLI:
+
+```bash
+az network application-gateway update -g <RG> -n <APPGW> --set tags.test=$(date +%s)
+```
+
+A tag change forces a control-plane PUT and triggers the drain/reconfigure cycle without altering data-plane behaviour. Note the start time.
+
+## Measure interruption
+
+After the update completes (the CLI returns), inspect each client log:
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do echo "=== client $i ==="; grep -B1 -A1 RECONNECT ~/lab/c$i.log | tail -12; done
+```
+
+You'll see something like:
+```
+2026-05-01T04:12:18.314Z      ← last timestamp from old connection
+--- RECONNECT 2026-05-01T04:12:46.902Z ---
+2026-05-01T04:12:47.005Z      ← first timestamp from new connection
+```
+
+**Gap = `RECONNECT timestamp` − `last timestamp before it`.** That's your interruption window for that client.
+
+Compute all 8 gaps in one shot:
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do awk '/RECONNECT/{split($0,a," "); rec=a[3]; gsub("Z","",rec); gsub("Z","",prev); cmd="date -d "prev" +%s.%3N"; cmd|getline t1; close(cmd); cmd="date -d "rec" +%s.%3N"; cmd|getline t2; close(cmd); printf "client '$i' gap = %.3fs\n", t2-t1; next} {prev=$0}' ~/lab/c$i.log; done
+```
+
+## Repeat with different change types
+
+Run several updates and tabulate. Examples to try:
+
+| Change | Command |
 |---|---|
-| Instance not in the current batch | 0 ms — connection unaffected |
-| Instance in the batch being updated | Connection enters draining; **closed at ~30s** if still open |
-| Reconnect after drop | New TCP + TLS handshake against a healthy instance, typically **<1s** |
+| Tag-only PUT | `az network application-gateway update -g RG -n GW --set tags.t=$(date +%s)` |
+| Add HTTP listener | `az network application-gateway http-listener create ...` |
+| Modify backend setting timeout | `az network application-gateway http-settings update ... --timeout 35` |
+| Add a probe | `az network application-gateway probe create ...` |
+| Capacity change (8→9 instances) | `az network application-gateway update ... --set autoscaleConfiguration.minCapacity=9` |
 
-So per config change, **either no interruption at all, or one ~30s drain followed by a ~1s reconnect** — depending on which of the 8 instances your flow happens to be pinned to.
+## Expected pattern
 
-## Minimal lab — one client, one server, one timeline
+- **Tag-only PUT:** often **0 drops** on most/all clients — control-plane only.
+- **Real config change (listener/backend/probe):** rolling instance recycle. Typically **1–N out of 8 clients** drop, with gaps **between a few seconds and ~30s** each, matching the drain window.
+- **Capacity change:** new instances spin up; existing connections usually unaffected, but verify.
 
-Use your existing port 8490 setup. You only need to add a "heartbeat with timestamp" so you can see the exact second the connection drops and the exact second the reconnect succeeds.
-
-### Backend (already running from previous lab)
-
-`ncat --ssl ... -lk -p 8490 -c cat` — nothing to change.
-
-### Source VM — one line that logs every event with a timestamp
-
+Cleanup:
 ```bash
-while true; do echo "$(date -u +%FT%T.%3NZ) RECONNECT"; (while true; do date -u +%FT%T.%3NZ; sleep 1; done) | openssl s_client -connect $APPGW:8490 -quiet 2>/dev/null; done | tee -a heartbeat.log
+tmux kill-session -t recon ; for i in 1 2 3 4 5 6 7 8; do tmux kill-session -t c$i; done
 ```
 
-What this does: opens a TLS connection through App Gateway, sends one timestamp per second, echoes received timestamps to `heartbeat.log`, and **the moment the connection drops**, the inner loop exits and the outer `while` immediately reconnects, logging `RECONNECT` with a timestamp. Run inside `tmux` so you can leave it:
-
-```bash
-tmux new -d -s hb 'while true; do echo "$(date -u +%FT%T.%3NZ) RECONNECT"; (while true; do date -u +%FT%T.%3NZ; sleep 1; done) | openssl s_client -connect $APPGW:8490 -quiet 2>/dev/null; done | tee -a heartbeat.log'
-```
-
-### Trigger a config change
-
-In the Azure portal, do something harmless that forces a PUT — easiest is **add a tag** to the App Gateway resource and Save, or change min instance count by 1 and revert. Note the wall-clock time you click Save.
-
-### Read the result
-
-```bash
-grep -B1 RECONNECT heartbeat.log | tail -20
-```
-
-You'll see a pattern like:
-```
-2026-05-01T10:14:32.104Z      <- last timestamp echoed before drop
-2026-05-01T10:15:02.881Z RECONNECT   <- reconnect succeeded
-```
-
-The gap between those two timestamps **is your interruption duration** for this connection on this config change.
-
-## What to expect across multiple changes
-
-Run 5–10 config changes (with a few minutes between each) and tabulate the gaps:
-
-| Change # | Gap (s) | Interpretation |
-|---|---|---|
-| 1 | ~0 | your instance wasn't in the batch |
-| 2 | ~31 | your instance was in the batch — drained at 30s + ~1s reconnect |
-| 3 | ~0 | not in batch |
-| ... | | |
-
-With 8 instances, statistically your single connection lands in the affected batch on a fraction of changes (depends on Azure's batch size — typically 1–2 instances at a time). Most changes are invisible to you; the ones that hit your instance show ~30s.
-
-## Bottom line for your design
-
-Worst-case per config change for any one long-running flow: **≈30 seconds**, deterministic, then auto-recovers. To make the application resilient, the client must **reconnect on TCP close** — exactly what the one-liner above does. If your real client doesn't auto-reconnect, that's the gap to close in the application, not in App Gateway.
+Result: you'll have empirical, per-client, sub-second-accurate measurements of the actual interruption your long-lived TLS-over-TCP connections experience for each type of change in your environment.
