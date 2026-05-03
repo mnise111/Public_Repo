@@ -1,0 +1,184 @@
+## Context
+
+SMXX_PROTOCOL (binds to SMSC, persistent TLS-over-TCP, sequence-numbered PDUs, windowed) and MMX_PROTOCOL (SOAP/HTTP-over-TLS for MMS, request/response). Both ride your App Gateway L4 listeners. SMXX_PROTOCOL especially is unforgiving — bind churn, dropped windows, and duplicate `submit_sm` cause real customer-visible problems (lost MO/MT, duplicate SMS, billing disputes, 2FA failures).
+
+Below are the caveats that matter when this is production, with one validation test each.
+
+---
+
+## Caveat 1 — 30 s drain on every config PUT cuts SMXX_PROTOCOL binds
+
+**Issue:** Any change (tag, listener add, cert rotation, autoscale edit) terminates active connections within 30 s. SMXX_PROTOCOL clients must rebind; in-flight `submit_sm` PDUs without received `submit_sm_resp` are ambiguous — was it delivered or not?
+
+**Mitigation:**
+- Enforce **change windows** outside peak SMS hours.
+- Require **idempotent message IDs** end-to-end so retries don't double-send.
+- SMXX_PROTOCOL client must implement `submit_sm` retry with the **same** message reference and reconcile via `query_sm` or DLR.
+- Set SMXX_PROTOCOL `enquire_link` interval ≤ 30 s so clients detect the drop fast.
+
+**Test:** with a sustained load of 50 `submit_sm` per second through AppGW, apply a tag change. Count PDUs sent vs `submit_sm_resp` received vs DLRs received. Expect ≤ 30 s of in-flight ambiguity; reconciliation must close the gap to zero loss and zero duplicates.
+```bash
+tmux new -d -s SMXX_PROTOCOL "SMXX_PROTOCOLload -H $APPGW -p 2775 --rate 50 --count 30000 --idempotency-key uuid 2>&1 | tee ~/SMXX_PROTOCOL.log"
+# trigger config change, then:
+grep -cE 'submit_sm sent' ~/SMXX_PROTOCOL.log; grep -cE 'submit_sm_resp' ~/SMXX_PROTOCOL.log; grep -cE 'DLR delivered' ~/SMXX_PROTOCOL.log
+```
+
+---
+
+## Caveat 2 — Backend pool member changes are not connection-graceful
+
+**Issue:** Adding or removing a backend VM from the pool is a config PUT — it triggers the same 30 s drain on **all** existing connections, not just the affected member.
+
+**Mitigation:**
+- Never edit the pool to swap a VM. Instead, take the VM out of rotation by **failing its health probe** (stop the SMXX_PROTOCOL listener on that VM), let AppGW mark it unhealthy (~30 s), then drain naturally. Only remove from pool config during a scheduled window.
+- Document this as a runbook step: "do not click 'Remove from backend pool' on a healthy VM during business hours."
+
+**Test:** with traffic running, (a) stop SMXX_PROTOCOL service on one backend VM and time how long until AppGW stops sending it new connections; (b) separately, in a maintenance window, remove a different VM from the pool via Portal and measure how many existing connections drop. Compare the blast radius.
+```bash
+tmux new -d -s churn "while true; do date -u +%s.%N; ss -tn state established '( dport = :2775 )' | wc -l; sleep 1; done | tee ~/churn.log"
+```
+
+---
+
+## Caveat 3 — TCP idle timeout silently kills idle SMXX_PROTOCOL binds
+
+**Issue:** AppGW backend setting timeout default is short. An SMXX_PROTOCOL bind that goes quiet between bursts will be reaped — the SMSC sees a half-open socket and discards subsequent `submit_sm` until rebind.
+
+**Mitigation:**
+- Set backend setting timeout to a value larger than your SMXX_PROTOCOL `enquire_link` interval × 2 (e.g. enquire_link=30 s → timeout ≥ 90 s, ideally 3600 s).
+- Require all SMXX_PROTOCOL clients to send `enquire_link` and process responses; treat missed responses as bind failure and rebind.
+
+**Test:** open a bind, send nothing for `timeout + 10 s`, then send one `submit_sm`. If the timeout is misconfigured, the PDU goes into a black hole.
+```bash
+tmux new -d -s idle "openssl s_client -connect $APPGW:2775 -quiet 2>/dev/null & sleep $((TIMEOUT+10)); echo TEST_PDU >> /proc/$!/fd/0; sleep 5; kill $!"
+```
+
+---
+
+## Caveat 4 — Autoscale-out events are also config PUTs
+
+**Issue:** Autoscale adding instances during a traffic spike (the worst possible time) triggers drain on existing connections. SMS traffic surges (election night, sports, alerts) are exactly when this fires.
+
+**Mitigation:**
+- **Pre-scale** before known peaks. Set Min instance count high enough to cover anticipated peak; let autoscale only handle unexpected overshoot.
+- Spread risk: use **multiple AppGWs behind Traffic Manager / Front Door** so a scale event on one doesn't cut all binds.
+- Cap Max instance count to avoid runaway scale events.
+
+**Test:** set Min=2 Max=10, generate load that forces scale-out, monitor SMXX_PROTOCOL bind drops vs scale events in AppGW activity log. Correlate timestamps.
+```bash
+az monitor activity-log list --resource-id $APPGW_ID --start-time $(date -u -d '1 hour ago' +%FT%TZ) --query "[?contains(operationName.value,'applicationGateway')].{time:eventTimestamp,op:operationName.value}" -o table
+```
+
+---
+
+## Caveat 5 — TLS cert rotation on the **backend** is invisible to AppGW
+
+**Issue:** Because TLS is end-to-end (AppGW is TCP-only), rotating the SMSC's cert does not cause AppGW to do anything. But existing TLS sessions continue using the old cert until they reconnect, and if your client pins on an old cert fingerprint, new connections fail while old ones succeed — confusing partial outage.
+
+**Mitigation:**
+- Maintain a chain of trust (CA pinning, not leaf pinning) on SMXX_PROTOCOL clients.
+- Stagger cert rotation per backend VM, 30 min apart, with health-probe verification between each.
+- Maintain `--reload` capability on the backend TLS terminator (e.g. nginx, stunnel) so the rotation does not require a process restart.
+
+**Test:** rotate the cert on one of three backend VMs while traffic is running. Confirm (a) existing binds to that VM stay up until they naturally cycle, (b) new binds get the new cert, (c) AppGW health probe stays green throughout.
+```bash
+tmux new -d -s certwatch "while true; do date -u +%s; echo | openssl s_client -connect $APPGW:2775 2>/dev/null | openssl x509 -noout -fingerprint -sha256; sleep 5; done | tee ~/cert.log"
+```
+
+---
+
+## Caveat 6 — Source NAT exhaustion at 8 instances × N backends
+
+**Issue:** AppGW SNATs every backend connection from a small pool of source ports per instance (~64k ÷ backend count). With heavy SMXX_PROTOCOL throughput (long-lived persistent binds + sub-second submit rates), you can exhaust ports per-instance, causing new binds to fail intermittently.
+
+**Mitigation:**
+- Calculate `instances × ~64k ÷ backend_count` against peak concurrent connection count + churn rate.
+- Scale instances horizontally rather than vertically.
+- Monitor backend connection failures — this is the symptom you'll actually see.
+
+**Test:** load-generate to ceiling and watch for `backendConnectFailure` in AppGW metrics.
+```bash
+az monitor metrics list --resource $APPGW_ID --metric "BackendConnectFailures,FailedRequests" --interval PT1M -o table
+```
+
+---
+
+## Caveat 7 — Health probe doesn't detect SMXX_PROTOCOL bind health, only TCP open
+
+**Issue:** Default TCP probe says "port is listening." It says nothing about whether the SMSC will accept a `bind_transceiver` (out of system_id licenses, DB down, app-layer deadlock). AppGW happily sends bind requests to a "healthy" backend that rejects every one.
+
+**Mitigation:**
+- Front the SMSC with a tiny TCP health responder that performs a synthetic `bind_transceiver` against the real SMSC and only listens on the probe port if it succeeds.
+- Or: configure a **custom probe** with a request body that elicits an SMXX_PROTOCOL-meaningful response and a match condition.
+
+**Test:** stop the SMXX_PROTOCOL application on one backend VM but **leave the TCP port listening** (e.g. via `nc -lk`). Default probe stays green; traffic gets sent to a broken backend. This is the failure you must engineer around.
+```bash
+sudo systemctl stop smsc && sudo nc -lk -p 2775 &
+# observe AppGW backend health: it remains green
+```
+
+---
+
+## Caveat 8 — MMX_PROTOCOL message size + AppGW request limits
+
+**Issue:** MMX_PROTOCOL SOAP attachments (MMS) can be large (hundreds of KB to a few MB). On L4 listeners this is fine, but if the same AppGW also has L7 listeners with default request body limits, operators sometimes mistakenly route MMX_PROTOCOL through L7 and hit the limit.
+
+**Mitigation:**
+- Document per-listener routing explicitly; never share a listener between L4 SMXX_PROTOCOL/MMX_PROTOCOL and L7 anything.
+- If MMX_PROTOCOL is on L7 (HTTPS), confirm request body limit ≥ your MMS max size + 20%.
+
+**Test:** send an MMX_PROTOCOL `SubmitReq` with a large attachment via the production listener; verify the SMSC/MMSC receives the full payload.
+```bash
+curl -k --data-binary @big_mms.xml https://$APPGW:8490/MMX_PROTOCOL/submit -o resp.xml; sha256sum big_mms.xml resp.xml
+```
+
+---
+
+## Caveat 9 — No "drain in progress" signal to the application
+
+**Issue:** AppGW does not tell the SMXX_PROTOCOL client "I am about to disconnect you." There is no L4 equivalent of HTTP `Connection: close` plus a 503. The first sign is the FIN.
+
+**Mitigation:**
+- Build the client to treat **any** `recv` of zero bytes during an active bind as a planned event, not an error: log, rebind, resume from last ACKed sequence number, never resend ACKed PDUs.
+- On the client, maintain a **resend buffer** of unacknowledged PDUs keyed by `sequence_number` + idempotency key.
+
+**Test:** force a drain via tag change, verify that on rebind the client resumes without resending any PDU that was already responded to and without losing any unACKed PDU.
+```bash
+diff <(awk '/sequence_sent/{print $2}' ~/SMXX_PROTOCOL.log | sort -u) <(awk '/sequence_acked/{print $2}' ~/SMXX_PROTOCOL.log | sort -u)
+```
+The diff should show only the small set of in-flight PDUs at the moment of drain — those get retried with the same sequence numbers and produce zero duplicates downstream.
+
+---
+
+## Caveat 10 — Region failure / AppGW failure is not in scope of any single AppGW
+
+**Issue:** Zone redundancy protects against zone failure; nothing protects against the regional AppGW service or your AppGW resource itself going bad. A misconfigured PUT can also brick a single gateway.
+
+**Mitigation:**
+- Deploy **paired AppGWs in two regions** with Traffic Manager (DNS) or Azure Front Door in front for SMXX_PROTOCOL/MMX_PROTOCOL endpoints.
+- Roll config changes to one region, soak 24 h, then the other. **Never** PUT both gateways in the same maintenance window.
+- Maintain a tested, scripted rollback for every change.
+
+**Test:** dry-run failover: shift DNS to the secondary AppGW, verify SMXX_PROTOCOL clients reconnect to it, confirm DLRs flow back; then shift back. Document the RTO observed.
+```bash
+az network traffic-manager endpoint update --name primary --priority 200; sleep 60; az network traffic-manager endpoint update --name primary --priority 1
+```
+
+---
+
+## Change-control summary
+
+| # | Caveat | Mitigation type | Test |
+|---|---|---|---|
+| 1 | 30s drain on PUT | Idempotency, retries, change windows | Load + tag change |
+| 2 | Pool edit drains all conns | Health-probe based removal | Stop service vs pool-edit comparison |
+| 3 | Idle timeout reaps binds | Tune timeout, enquire_link | Idle-then-send |
+| 4 | Autoscale = config change | Pre-scale, multi-AppGW | Load + activity log |
+| 5 | Backend cert rotation | CA pinning, staggered roll | Live cert fingerprint watch |
+| 6 | SNAT exhaustion | Capacity planning | Metrics under peak |
+| 7 | Probe ≠ app health | Synthetic SMXX_PROTOCOL probe | Stop app, keep port |
+| 8 | L7 size limits if mis-routed | Strict listener separation | Large MMX_PROTOCOL submit |
+| 9 | No drain signal | Client-side resume logic | PDU sequence diff post-drain |
+| 10 | AppGW/region failure | Multi-region + DNS failover | DNS shift drill |
+
+Run all 10 tests in a non-production AppGW that mirrors production sizing (8 instances, 3 backends). Sign off only after every test produces the documented expected outcome and the runbook reflects the observed timings.
